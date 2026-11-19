@@ -153,6 +153,10 @@ jobs:
           brew style --formula "$FORMULA"
           brew audit --formula --strict --online "$FORMULA"
 
+      - name: Install the GitHub CLI
+        # The macos-26 runner image doesn't include gh; the steps below use it.
+        run: command -v gh || brew install gh
+
       # After the build and the audits, so that a failed run never removes anything.
       - name: Delete a release that a failed run left behind
         if: steps.formula.outputs.done == 'false'
