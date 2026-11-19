@@ -1,0 +1,216 @@
+# Updates Formula/touchglass.rb to a tagged TouchGlass release and publishes its bottle.
+#
+# Builds and tests the bottle with `brew test-bot`, as tests.yml does for pull requests, uploads it with
+# `brew pr-upload` to the release `touchglass-<version>` in this repository, and commits the formula to
+# `main` through the GitHub contents API, so that GitHub signs the commit.
+#
+# Safe to run again: if the formula on `main` already points at the version and has its bottle, the run
+# stops early. A release that a failed run left behind is deleted and rebuilt after the new bottle passed
+# its tests, but only if the formula on `main` doesn't refer to it. If `main` publishes the version
+# already and its source tarball changed, the run stops: that needs a new version or a `revision`.
+#
+# The formula commit that this workflow makes doesn't start tests.yml, because GitHub doesn't start
+# workflows for commits made with GITHUB_TOKEN; this run did the same checks. If `main` gets a branch
+# protection rule, allow GitHub Actions to push to it, or the last step fails after the bottle is
+# published (the next run deletes that release and rebuilds it).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: TouchGlass version to release, such as 0.1.1. Empty means the latest v*.*.* tag.
+        required: false
+        default: ""
+
+permissions: {}
+
+# One release at a time: two runs would race on the formula and on the tap's releases.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+env:
+  FORMULA: ambroos/touchglass/touchglass
+  FORMULA_PATH: Formula/touchglass.rb
+  SOURCE_REPOSITORY: ambroos/touchglass
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    # No cache step: a job that can publish releases starts without restored state.
+    steps:
+      # The formula commit goes to main and is based on the file as this run checked it out. A failing
+      # step instead of a job-level `if`, so that a run from another branch doesn't show as successful.
+      - name: Check the branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != refs/heads/main ]]; then
+            echo "::error::Run the Release workflow from main, not $REF."
+            exit 1
+          fi
+
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@63a2d4d8d4193eab3e62b1b782ff3ab8408f5b29 # 2026.11.09.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          if [[ -z "$version" ]]; then
+            version="$(git ls-remote --tags --refs "https://github.com/$SOURCE_REPOSITORY.git" 'v*.*.*' |
+              sed -n 's|.*refs/tags/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::No version to release, or not like 1.2.3: '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the bottle directory
+        run: mkdir -p "$RUNNER_TEMP/bottles"
+
+      # Before the formula edit, so that no clean-up step can undo it. test-bot resets only other taps.
+      - name: Clean up before the build
+        working-directory: ${{ runner.temp }}/bottles
+        run: brew test-bot --only-cleanup-before
+
+      - name: Check the build environment
+        working-directory: ${{ runner.temp }}/bottles
+        run: brew test-bot --only-setup
+
+      - name: Update url and sha256
+        id: formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAP_PATH: ${{ steps.set-up-homebrew.outputs.repository-path }}
+        run: |
+          cd "$TAP_PATH"
+          url="https://github.com/$SOURCE_REPOSITORY/archive/refs/tags/v$VERSION.tar.gz"
+          sha256="$(curl -fsSL --retry 3 "$url" | shasum -a 256 | cut -d ' ' -f 1)"
+          # A plain edit instead of `brew bump-formula-pr --write-only`: that command refuses a URL that
+          # the formula has already, which a first release with a placeholder sha256 needs.
+          URL="$url" SHA256="$sha256" perl -0pi -e '
+            s/^  url "[^"]*"/  url "$ENV{URL}"/m or die "no url line\n";
+            s/^  sha256 "[^"]*"/  sha256 "$ENV{SHA256}"/m or die "no sha256 line\n";
+          ' "$FORMULA_PATH"
+          grep -qxF "  url \"$url\"" "$FORMULA_PATH"
+          grep -qxF "  sha256 \"$sha256\"" "$FORMULA_PATH"
+          git diff -- "$FORMULA_PATH"
+
+          # The bottle tag that brew test-bot uses: <formula>-<version>, with _<revision> if the formula has one.
+          pkg_version="$(brew ruby -e "puts Formula[\"$FORMULA\"].pkg_version")"
+          # With runner debug logging, brew can print more than the version; it must not reach the tag.
+          if [[ ! "$pkg_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(_[0-9]+)?$ ]]; then
+            echo "::error::Unexpected pkg_version from brew: '$pkg_version'"
+            exit 1
+          fi
+          release_tag="touchglass-$pkg_version"
+          root_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$release_tag"
+          echo "release-tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "root-url=$root_url" >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet -- "$FORMULA_PATH" && grep -qF "root_url \"$root_url\"" "$FORMULA_PATH"; then
+            echo "::notice::$FORMULA $pkg_version and its bottle are on main already; nothing to do."
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          elif git show "HEAD:$FORMULA_PATH" > "$RUNNER_TEMP/committed.rb" &&
+            grep -qF "root_url \"$root_url\"" "$RUNNER_TEMP/committed.rb"; then
+            # main installs from this release, so it must not be replaced. A source tarball whose
+            # checksum changed without a version change is what moved tags and regenerated archives do.
+            echo "::error::main publishes $pkg_version from $root_url already, but the url or sha256 for v$VERSION differs. Release a new version, or add or raise revision in the formula; this run changes nothing."
+            exit 1
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build, test and audit the bottle
+        if: steps.formula.outputs.done == 'false'
+        working-directory: ${{ runner.temp }}/bottles
+        env:
+          ROOT_URL: ${{ steps.formula.outputs.root-url }}
+        run: |
+          brew test-bot --only-formulae --skip-dependents --testing-formulae="$FORMULA" --root-url="$ROOT_URL"
+          ls -l ./*.bottle.*
+
+      - name: Audit the formula
+        if: steps.formula.outputs.done == 'false'
+        run: |
+          brew style --formula "$FORMULA"
+          brew audit --formula --strict --online "$FORMULA"
+
+      # After the build and the audits, so that a failed run never removes anything.
+      - name: Delete a release that a failed run left behind
+        if: steps.formula.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.formula.outputs.release-tag }}
+          ROOT_URL: ${{ steps.formula.outputs.root-url }}
+          TAP_PATH: ${{ steps.set-up-homebrew.outputs.repository-path }}
+        run: |
+          # The "Update url and sha256" step stops for this case already; check again right before the
+          # delete, because a release that main installs from must never go.
+          # A file instead of a pipe: with pipefail, a SIGPIPE in `git show` would read as "no match".
+          git -C "$TAP_PATH" show "HEAD:$FORMULA_PATH" > "$RUNNER_TEMP/committed.rb"
+          if grep -qF "root_url \"$ROOT_URL\"" "$RUNNER_TEMP/committed.rb"; then
+            echo "::error::The formula on main uses $ROOT_URL; not deleting $RELEASE_TAG."
+            exit 1
+          fi
+          if error="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1 > /dev/null)"; then
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          elif [[ "$error" != *"release not found"* ]]; then
+            echo "::error::Can't tell whether release $RELEASE_TAG exists: $error"
+            exit 1
+          fi
+
+      - name: Upload the bottle
+        if: steps.formula.outputs.done == 'false'
+        working-directory: ${{ runner.temp }}/bottles
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROOT_URL: ${{ steps.formula.outputs.root-url }}
+        run: |
+          # Writes the bottle block into the formula without a local commit, then uploads the bottle to
+          # the release and publishes it.
+          brew pr-upload --verbose --no-commit --root-url="$ROOT_URL"
+
+      - name: Attest the bottle's build provenance
+        if: steps.formula.outputs.done == 'false'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/bottles/*.bottle.*tar.gz
+
+      - name: Commit the formula to main
+        if: steps.formula.outputs.done == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAP_PATH: ${{ steps.set-up-homebrew.outputs.repository-path }}
+        run: |
+          cd "$TAP_PATH"
+          git diff -- "$FORMULA_PATH"
+          # GitHub signs commits that the contents API makes for GITHUB_TOKEN. The blob SHA of the file
+          # this run started from makes the API refuse the commit if main changed the formula meanwhile;
+          # run the workflow again then.
+          base64 < "$FORMULA_PATH" | tr -d '\n' > "$RUNNER_TEMP/formula.b64"
+          jq -n \
+            --arg message "touchglass $VERSION" \
+            --rawfile content "$RUNNER_TEMP/formula.b64" \
+            --arg sha "$(git rev-parse "HEAD:$FORMULA_PATH")" \
+            '{message: $message, content: $content, sha: $sha, branch: "main"}' |
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$FORMULA_PATH" --input - \
+              --jq '"Committed " + .commit.sha + " (verified: " + (.commit.verification.verified | tostring) + ")"'
