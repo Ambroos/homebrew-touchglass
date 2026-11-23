@@ -1,8 +1,8 @@
 class Touchglass < Formula
   desc "Liquid Glass PIN and touch prompts for YubiKey operations in gpg-agent"
   homepage "https://github.com/ambroos/touchglass"
-  url "https://github.com/ambroos/touchglass/archive/refs/tags/v0.1.2.tar.gz"
-  sha256 "a9067539f039d2de91eb3f4e423fa8fac896d42d3048ce217117575e9ee7f090"
+  url "https://github.com/ambroos/touchglass/archive/refs/tags/v0.1.3.tar.gz"
+  sha256 "ebf66aed5a3d46360a5663249a34ebedecbfa24da2ab34bf6a9f586e1e1691ba"
   license "Apache-2.0"
   head "https://github.com/ambroos/touchglass.git", branch: "main"
 
@@ -12,8 +12,8 @@ class Touchglass < Formula
   end
 
   bottle do
-    root_url "https://github.com/Ambroos/homebrew-touchglass/releases/download/touchglass-0.1.2"
-    sha256 arm64_tahoe: "82801a69faf8abcb972d129975913399f51d997d61ba8ed4e6fd8a31f62cce65"
+    root_url "https://github.com/Ambroos/homebrew-touchglass/releases/download/touchglass-0.1.3"
+    sha256 arm64_tahoe: "d4a8a896ab34516974503500c67f0ab85bec440d516ddcca7decbd5b95a60909"
   end
 
   depends_on "gnupg"
